@@ -114,6 +114,73 @@ class TestAgentChronos(unittest.TestCase):
         self.assertIn("agent_a", cv.clocks)
         self.assertGreaterEqual(cv.clocks["agent_a"], 1)
 
+    def test_per_destination_sequence_continuity_across_multiple_services(self) -> None:
+        # Agent A calls destination d1 (sap_s4hana), then d2 (bigquery), then d1 (sap_s4hana) again.
+        # Global CausalVector increments to 3, while X-Agent-Dest-Seq for sap_s4hana must be 1 then 2 (gap-free).
+        r1 = self.gateway.dispatch_agent_tool_call(
+            origin_agent="agent_a",
+            target_service="sap_s4hana",
+            method="GET",
+            payload={"doc": 1},
+            is_mutation=False,
+        )
+        r2 = self.gateway.dispatch_agent_tool_call(
+            origin_agent="agent_a",
+            target_service="bigquery",
+            method="GET",
+            payload={"q": 2},
+            is_mutation=False,
+        )
+        r3 = self.gateway.dispatch_agent_tool_call(
+            origin_agent="agent_a",
+            target_service="sap_s4hana",
+            method="GET",
+            payload={"doc": 3},
+            is_mutation=False,
+        )
+        self.assertEqual(r1.wire_headers["X-Agent-Dest-Seq"], "1")
+        self.assertEqual(r2.wire_headers["X-Agent-Dest-Seq"], "1")
+        self.assertEqual(r3.wire_headers["X-Agent-Dest-Seq"], "2")
+
+        self.gateway.handle_incoming_request(r1.wire_headers, recipient_agent_id="sap_s4hana")
+        self.gateway.handle_incoming_request(r3.wire_headers, recipient_agent_id="sap_s4hana")
+        self.assertEqual(self.gateway.get_sidecar_delivered_seq("sap_s4hana", "agent_a"), 2)
+
+    def test_causal_precedence_and_normative_commit_wait(self) -> None:
+        v1 = CausalVector(clocks={"a1": 1, "a2": 0}, max_truetime_ns=1000, sibling_bitmap=3)
+        v2 = CausalVector(clocks={"a1": 1, "a2": 2}, max_truetime_ns=1500)
+        v3 = CausalVector(clocks={"a1": 2, "a2": 1}, max_truetime_ns=1600)
+
+        self.assertTrue(v1.strictly_precedes(v2))
+        self.assertFalse(v2.strictly_precedes(v1))
+        self.assertTrue(v2.is_concurrent_with(v3))
+
+        # Round-trip compact JSON with sibling bitmap
+        hdr = v1.to_wire_header()
+        self.assertLessEqual(len(hdr), 190)
+        v1_parsed = CausalVector.from_wire_header(hdr)
+        self.assertEqual(v1_parsed.sibling_bitmap, 3)
+
+        # Generalized settlement window check
+        self.assertTrue(
+            TrueTimeInterval.validate_settlement_window(
+                t_e_earliest_ns=100, t_f_latest_ns=260, epsilon_eff_ns=40, epsilon_verifier_ns=50
+            )
+        )
+        self.assertFalse(
+            TrueTimeInterval.validate_settlement_window(
+                t_e_earliest_ns=200, t_f_latest_ns=180, epsilon_eff_ns=40
+            )
+        )
+
+        # Normative Eq. (5) commit-wait calculation
+        wait_ns = self.gateway.fence_engine.compute_normative_commit_wait_ns(
+            t_e_latest_ns=10_000_000,
+            v_f_t_max_ns=12_000_000,
+            t_now_earliest_ns=9_000_000,
+        )
+        self.assertEqual(wait_ns, 3_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

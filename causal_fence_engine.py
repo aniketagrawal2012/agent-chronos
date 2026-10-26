@@ -31,12 +31,34 @@ class CausalFenceEngine:
     and barrier resolutions across multi-agent swarms.
     """
 
-    def __init__(self, clock: TrueTimeClock) -> None:
+    def __init__(
+        self,
+        clock: TrueTimeClock,
+        abort_propagation_ns: int = 0,
+    ) -> None:
         self.clock: TrueTimeClock = clock
+        self.abort_propagation_ns: int = abort_propagation_ns
         self._lock = threading.RLock()
         self._epochs: Dict[str, SpeculativeEpoch] = {}
         self._agent_vectors: Dict[str, CausalVector] = {}
+        self._dest_sequences: Dict[Tuple[str, str], int] = {}
         self._aborted_epochs: Set[str] = set()
+
+    def next_dest_sequence(self, target_service: str, agent_id: str) -> int:
+        """
+        Increments and returns the gap-free per-destination sequence counter Seq_dest[d, AgentID].
+        Decoupled from the swarm-wide CausalVector so multi-destination tool invocations
+        never introduce sequence gaps at destination sidecars.
+        """
+        with self._lock:
+            key = (target_service, agent_id)
+            seq = self._dest_sequences.get(key, 0) + 1
+            self._dest_sequences[key] = seq
+            return seq
+
+    def get_dest_sequence(self, target_service: str, agent_id: str) -> int:
+        with self._lock:
+            return self._dest_sequences.get((target_service, agent_id), 0)
 
     def get_or_create_vector(self, agent_id: str) -> CausalVector:
         with self._lock:
@@ -123,8 +145,9 @@ class CausalFenceEngine:
         2. If the frame is NOT a mutation (read-only query):
            Status = IMMEDIATE (no pacing required).
         3. If the frame is a MUTATION and depends on an uncommitted speculative epoch
-           whose TrueTime interval overlaps with current physical time:
-           Status = PACED_HELD (must stall until the TrueTime uncertainty window elapses).
+           whose TrueTime interval + abort propagation bound overlaps with current physical time:
+           Status = PACED_HELD (must stall until the barrier window elapses:
+           Delta_wait = max(0, 2*epsilon_eff + Delta_abort_prop - Delta_t_ipc)).
         4. Otherwise:
            Status = RELEASED (safe for immediate transmission).
         """
@@ -143,13 +166,31 @@ class CausalFenceEngine:
             if not frame.is_mutation:
                 return (PacingStatus.IMMEDIATE, 0.0, None)
 
-            # For mutating actions, enforce TrueTime linearizable ordering
+            # For mutating actions, enforce TrueTime linearizable ordering + abort propagation margin
             if epoch and epoch.state != EpochState.COMMITTED:
-                # Calculate wait required until epoch.latest_ns is in the past
                 hw_now = self.clock.get_hardware_time_ns()
-                wait_ns = epoch.truetime_interval.wait_duration_ns(hw_now)
+                wait_ns = max(0, (epoch.truetime_interval.latest_ns + self.abort_propagation_ns) - hw_now)
                 if wait_ns > 0:
                     wait_ms = wait_ns / 1_000_000.0
                     return (PacingStatus.PACED_HELD, wait_ms, None)
 
             return (PacingStatus.RELEASED, 0.0, None)
+
+    def compute_normative_commit_wait_ns(
+        self,
+        t_e_latest_ns: int,
+        v_f_t_max_ns: int = 0,
+        t_now_earliest_ns: Optional[int] = None,
+    ) -> int:
+        """
+        Evaluates Eq. (5) normative runtime commit-wait barrier:
+        Delta_wait = max(0, t_{E,latest}^* + Delta_{abort_prop} - t_{now,earliest})
+        where t_{E,latest}^* = max(t_{E,latest}, t_{max,F}).
+        """
+        t_star_latest = max(t_e_latest_ns, v_f_t_max_ns)
+        now_earliest = (
+            t_now_earliest_ns
+            if t_now_earliest_ns is not None
+            else self.clock.now().earliest_ns
+        )
+        return max(0, t_star_latest + self.abort_propagation_ns - now_earliest)

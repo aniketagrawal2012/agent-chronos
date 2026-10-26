@@ -51,19 +51,21 @@ def run_benchmark(n_runs: int = 1000) -> Dict[str, Any]:
         # Simulate LLM branch abort probability (e.g. 15% rate of policy/hallucination aborts)
         branch_aborted = random.random() < 0.15
         
-        # Simulated wide-area network jitter between clouds (10ms to 60ms)
-        net_jitter_ms = random.uniform(10.0, 60.0)
+        # Simulated wide-area network transit latency for upstream and downstream paths (10ms to 60ms)
+        upstream_wan_ms = random.uniform(10.0, 60.0)
+        downstream_wan_ms = random.uniform(10.0, 60.0)
+        inter_dispatch_offset_ms = 8.0
 
         # ----------------------------------------------------
         # 1. Baseline Evaluation (No TrueTime Transport Pacing)
         # ----------------------------------------------------
         # In baseline, Agent 2 fires immediately without waiting for Agent 1's uncertainty epoch.
         # If Agent 1 aborts shortly after, Agent 2 has already transmitted its mutation = PHANTOM WRITE!
-        # If network reorders packet arrival within jitter window = CAUSAL INVERSION!
+        # If downstream packet arrives before upstream packet (t_arr2 < t_arr1) = CAUSAL INVERSION!
         if branch_aborted:
             baseline_phantom_mutations += 1
         
-        if random.random() < 0.22:  # 22% risk of out-of-order race without TrueTime
+        if (inter_dispatch_offset_ms + downstream_wan_ms) < upstream_wan_ms:
             baseline_causal_inversions += 1
 
         # ----------------------------------------------------

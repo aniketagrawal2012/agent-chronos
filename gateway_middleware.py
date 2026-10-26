@@ -28,14 +28,64 @@ from truetime_clock import TrueTimeClock
 
 class AgentChronosGateway:
     """
-    Gateway middleware for multi-agent systems (Google ADK / FastMCP / Vertex AI).
+    Gateway middleware for multi-agent systems (Google ADK / FastMCP / Gemini Enterprise Agent Platform).
     Intercepts wire traffic and guarantees linearizable external consistency.
     """
 
-    def __init__(self, clock_uncertainty_ns: int = TrueTimeClock.DEFAULT_EPSILON_NS) -> None:
+    def __init__(
+        self,
+        clock_uncertainty_ns: int = TrueTimeClock.DEFAULT_EPSILON_NS,
+        abort_propagation_ns: int = 0,
+        project_id: str = "aniket-personal",
+        location: str = "global",
+        model_name: str = "gemini-3.8-flash",
+    ) -> None:
         self.clock: TrueTimeClock = TrueTimeClock(uncertainty_epsilon_ns=clock_uncertainty_ns)
-        self.fence_engine: CausalFenceEngine = CausalFenceEngine(self.clock)
+        self.fence_engine: CausalFenceEngine = CausalFenceEngine(
+            self.clock, abort_propagation_ns=abort_propagation_ns
+        )
         self.pacer: TransportPacer = TransportPacer(self.clock, self.fence_engine)
+        self.project_id = project_id
+        self.location = location
+        self.model_name = model_name
+        self._sidecar_delivered_seq: Dict[Tuple[str, str], int] = {}
+
+    def verify_speculative_epoch_with_gemini(
+        self,
+        epoch_id: str,
+        tool_name: str,
+        payload: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Verifies a speculative tool invocation using live Gemini models on the
+        Gemini Enterprise Agent Platform (`project="aniket-personal"`, `location="global"`)
+        via the Google Gen AI SDK (`google.genai`).
+        """
+        import subprocess
+        from google import genai
+        from google.oauth2.credentials import Credentials
+
+        token = subprocess.check_output(
+            ["gcloud", "auth", "print-access-token"], text=True, timeout=5.0
+        ).strip()
+        creds = Credentials(token=token, quota_project_id=self.project_id) if token else None
+        client = genai.Client(
+            vertexai=True,
+            project=self.project_id,
+            location=self.location,
+            credentials=creds,
+        )
+        prompt = (
+            "Respond strictly with JSON {\"approved\": true} if the following tool payload "
+            "has a positive amount and valid structure, else {\"approved\": false}: "
+            f"tool={tool_name}, payload={payload}"
+        )
+        resp = client.models.generate_content(model=self.model_name, contents=prompt)
+        txt = (resp.text or "").strip().lower()
+        approved = '"approved": true' in txt or '"approved":true' in txt
+        if not approved:
+            self.abort_speculative_branch(epoch_id)
+        return approved, resp.text or ""
 
     def handle_incoming_request(
         self,
@@ -44,12 +94,15 @@ class AgentChronosGateway:
     ) -> Tuple[Optional[TrueTimeInterval], Optional[CausalVector], Optional[str]]:
         """
         Processes inbound wire headers from an upstream agent.
-        Extracts TrueTime interval, causal fence vector, and speculative epoch ID,
-        and merges them into local causality state.
+        Extracts TrueTime interval, causal fence vector, per-destination sequence counter,
+        and speculative epoch ID, and merges them into local causality state.
         """
         tt_header = headers.get("X-Agent-TrueTime-Window")
         cv_header = headers.get("X-Agent-Causal-Fence-Vector")
         epoch_header = headers.get("X-Agent-Speculative-Epoch")
+        dest_seq_header = headers.get("X-Agent-Dest-Seq")
+        origin_header = headers.get("X-Agent-Origin", "")
+        target_header = headers.get("X-Agent-Target", recipient_agent_id)
 
         inbound_tt: Optional[TrueTimeInterval] = None
         inbound_cv: Optional[CausalVector] = None
@@ -62,7 +115,18 @@ class AgentChronosGateway:
             local_vec = self.fence_engine.get_or_create_vector(recipient_agent_id)
             local_vec.merge(inbound_cv)
 
+        if dest_seq_header and origin_header:
+            seq_val = int(dest_seq_header)
+            key = (target_header, origin_header)
+            prev_seq = self._sidecar_delivered_seq.get(key, 0)
+            if seq_val == prev_seq + 1:
+                self._sidecar_delivered_seq[key] = seq_val
+
         return (inbound_tt, inbound_cv, epoch_header)
+
+    def get_sidecar_delivered_seq(self, target_service: str, origin_agent: str) -> int:
+        """Returns the highest contiguous per-destination sequence number delivered at target_service."""
+        return self._sidecar_delivered_seq.get((target_service, origin_agent), 0)
 
     def dispatch_agent_tool_call(
         self,
@@ -75,7 +139,8 @@ class AgentChronosGateway:
     ) -> PacingResult:
         """
         High-level API for an agent issuing a tool execution.
-        Automatically registers an epoch, assembles wire frame, and passes through pacer.
+        Automatically registers an epoch, increments the per-destination sequence counter,
+        assembles the wire frame, and passes through the transport pacer.
         """
         action_id = f"act_{uuid.uuid4().hex[:8]}"
         epoch_id = f"ep_{uuid.uuid4().hex[:8]}"
@@ -88,6 +153,7 @@ class AgentChronosGateway:
         )
 
         vec = self.fence_engine.get_or_create_vector(origin_agent)
+        dest_seq = self.fence_engine.next_dest_sequence(target_service, origin_agent)
 
         frame = WireFrame(
             action_id=action_id,
@@ -98,7 +164,8 @@ class AgentChronosGateway:
             is_mutation=is_mutation,
             truetime_interval=epoch.truetime_interval,
             causal_vector=vec,
-            speculative_epoch_id=epoch_id
+            speculative_epoch_id=epoch_id,
+            dest_seq=dest_seq,
         )
 
         # Dispatch via transport pacer
