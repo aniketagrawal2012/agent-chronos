@@ -56,6 +56,14 @@ class TrueTimeInterval:
             )
 
     @staticmethod
+    def compute_epsilon_eff_ns(epsilon_verifier_ns: int, epsilon_gateway_ns: int) -> int:
+        """
+        Composes heterogeneous cross-node uncertainty bounds with conservative ceiling
+        rounding in integer nanoseconds: ceil((epsilon_verifier + epsilon_gateway) / 2).
+        """
+        return (epsilon_verifier_ns + epsilon_gateway_ns + 1) // 2
+
+    @staticmethod
     def validate_settlement_window(
         t_e_earliest_ns: int,
         t_f_latest_ns: int,
@@ -119,6 +127,21 @@ class CausalVector:
         if current_truetime_ns > self.max_truetime_ns:
             self.max_truetime_ns = current_truetime_ns
 
+    def snapshot_tentative(
+        self, agent_id: str, ticket: int, current_truetime_ns: int
+    ) -> CausalVector:
+        """
+        Constructs an isolated branch-local tentative pre-staging vector V_F without mutating
+        self's shared committed state (Eq. 3). Discarded cleanly if F is revoked.
+        """
+        tentative_clocks = dict(self.clocks)
+        tentative_clocks[agent_id] = max(tentative_clocks.get(agent_id, 0) + 1, ticket)
+        return CausalVector(
+            clocks=tentative_clocks,
+            max_truetime_ns=max(self.max_truetime_ns, current_truetime_ns),
+            sibling_bitmap=self.sibling_bitmap,
+        )
+
     def merge(self, other: CausalVector) -> None:
         for aid, count in other.clocks.items():
             self.clocks[aid] = max(self.clocks.get(aid, 0), count)
@@ -149,6 +172,22 @@ class CausalVector:
         }
         if self.sibling_bitmap:
             payload["b"] = self.sibling_bitmap
+        return json.dumps(payload, separators=(",", ":"))
+
+    def to_positional_wire_header(self, agent_order: Optional[List[str]] = None) -> str:
+        """
+        Serializes a 16-element positional integer array {"c":[c_0,...,c_15],"t":t_max,"b":bitmap}
+        requiring 69-121 bytes of unformatted raw JSON for c_k < 10^4.
+        """
+        order = agent_order if agent_order is not None else [f"a{i}" for i in range(16)]
+        arr = [self.clocks.get(aid, 0) for aid in order[:16]]
+        while len(arr) < 16:
+            arr.append(0)
+        payload: Dict[str, Any] = {
+            "c": arr,
+            "t": self.max_truetime_ns,
+            "b": self.sibling_bitmap,
+        }
         return json.dumps(payload, separators=(",", ":"))
 
     @classmethod

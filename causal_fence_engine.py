@@ -41,8 +41,44 @@ class CausalFenceEngine:
         self._lock = threading.RLock()
         self._epochs: Dict[str, SpeculativeEpoch] = {}
         self._agent_vectors: Dict[str, CausalVector] = {}
+        self._tentative_tickets: Dict[str, int] = {}
         self._dest_sequences: Dict[Tuple[str, str], int] = {}
+        self._key_settlement_floors: Dict[Tuple[str, str], int] = {}
         self._aborted_epochs: Set[str] = set()
+
+    def allocate_tentative_vector(self, agent_id: str, latest_ns: int) -> CausalVector:
+        """
+        Allocates a branch-local tentative pre-staging vector V_F without mutating the
+        agent's shared committed vector (Eq. 3).
+        """
+        with self._lock:
+            committed = self.get_or_create_vector(agent_id)
+            ticket = max(committed.clocks.get(agent_id, 0), self._tentative_tickets.get(agent_id, 0)) + 1
+            self._tentative_tickets[agent_id] = ticket
+            return committed.snapshot_tentative(agent_id, ticket, latest_ns)
+
+    def advance_key_settlement_floor(
+        self, target_service: str, resource_key: str, commit_latest_ns: int
+    ) -> int:
+        """
+        Enforces a monotonic per-key settlement floor t_{key_floor}[d, k] so any sibling
+        branch settling Phase 1 after F_1 cannot receive an earlier commit bound.
+        """
+        with self._lock:
+            k = (target_service, resource_key)
+            floor_ns = max(self._key_settlement_floors.get(k, 0), commit_latest_ns)
+            self._key_settlement_floors[k] = floor_ns + 1
+            return floor_ns
+
+    @staticmethod
+    def should_chain_sibling_read(
+        t_e_sib_earliest_ns: int, t_now_f_latest_ns: int
+    ) -> bool:
+        """
+        Evaluates Rule 1(b) overlapping or earlier commit interval condition:
+        t_{E_sib,earliest} <= t_{now,F,latest}.
+        """
+        return t_e_sib_earliest_ns <= t_now_f_latest_ns
 
     def next_dest_sequence(self, target_service: str, agent_id: str) -> int:
         """

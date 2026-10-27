@@ -181,6 +181,44 @@ class TestAgentChronos(unittest.TestCase):
         )
         self.assertEqual(wait_ns, 3_000_000)
 
+        # Ceiling-rounded epsilon_eff for opposite parity bounds
+        self.assertEqual(TrueTimeInterval.compute_epsilon_eff_ns(3_000_001, 4_000_000), 3_500_001)
+
+        # Positional 16-agent JSON byte budget (69-121 B unformatted)
+        v16_min = CausalVector(
+            clocks={f"a{i}": 1 for i in range(16)},
+            max_truetime_ns=1_700_000_000_000_000_000,
+            sibling_bitmap=0,
+        )
+        v16_max = CausalVector(
+            clocks={f"a{i}": 9999 for i in range(16)},
+            max_truetime_ns=1_700_000_000_000_000_000,
+            sibling_bitmap=65535,
+        )
+        self.assertEqual(len(v16_min.to_positional_wire_header()), 69)
+        self.assertEqual(len(v16_max.to_positional_wire_header()), 121)
+
+        # Branch-local tentative pre-staging vector isolation (no mutation of committed state on abort)
+        committed_before = dict(self.gateway.fence_engine.get_or_create_vector("agent_iso").clocks)
+        tentative = self.gateway.fence_engine.allocate_tentative_vector("agent_iso", 5_000_000)
+        self.assertEqual(tentative.clocks["agent_iso"], 1)
+        self.assertEqual(
+            self.gateway.fence_engine.get_or_create_vector("agent_iso").clocks,
+            committed_before,
+        )
+
+        # Rule 1(b) sibling commit interval overlap & monotonic key settlement floor
+        self.assertTrue(self.gateway.fence_engine.should_chain_sibling_read(100, 120))
+        floor1 = self.gateway.fence_engine.advance_key_settlement_floor("sap_s4hana", "ledger_1", 500)
+        floor2 = self.gateway.fence_engine.advance_key_settlement_floor("sap_s4hana", "ledger_1", 480)
+        self.assertEqual(floor1, 500)
+        self.assertEqual(floor2, 501)
+
+        # Stale sibling HTTP 409 rejection advances tombstoned ingress sequence watermark
+        code, delivered = self.gateway.reject_stale_sibling_frame("sap_s4hana", "agent_sib", 1)
+        self.assertEqual(code, 409)
+        self.assertEqual(delivered, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -128,6 +128,20 @@ class AgentChronosGateway:
         """Returns the highest contiguous per-destination sequence number delivered at target_service."""
         return self._sidecar_delivered_seq.get((target_service, origin_agent), 0)
 
+    def reject_stale_sibling_frame(
+        self, target_service: str, origin_agent: str, seq_val: int
+    ) -> Tuple[int, int]:
+        """
+        Handles HTTP 409 Stale Sibling Timestamp rejection at the ingress sidecar by
+        advancing Seq_{loc,d}[a_s] to Seq_{dest,F}[d, a_s] as a tombstoned coordinate
+        so subsequent valid frames from origin_agent do not stall.
+        """
+        key = (target_service, origin_agent)
+        prev_seq = self._sidecar_delivered_seq.get(key, 0)
+        if seq_val == prev_seq + 1:
+            self._sidecar_delivered_seq[key] = seq_val
+        return (409, self._sidecar_delivered_seq.get(key, 0))
+
     def dispatch_agent_tool_call(
         self,
         origin_agent: str,
