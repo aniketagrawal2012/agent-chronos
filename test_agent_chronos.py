@@ -255,6 +255,23 @@ class TestAgentChronos(unittest.TestCase):
         self.assertTrue(self.gateway.fence_engine.should_preempt_on_abort(11_500_000, 12_000_000))
         self.assertFalse(self.gateway.fence_engine.should_preempt_on_abort(12_500_000, 12_000_000))
 
+        # O(1) destination-wide summary watermark t_{max_all_keys}[d] evaluated on wildcard '*'
+        self.assertEqual(
+            self.gateway.fence_engine.get_key_settlement_floor("sap_s4hana", {"*"}),
+            502,
+        )
+
+        # SIBLING_CLEAR out-of-order TTL cache lookup and concurrent sibling read non-cascading
+        self.gateway.record_sibling_clear("sap_s4hana", "agent_sib", t_latest_ns=500, tentative_ticket=1)
+        self.assertTrue(
+            self.gateway.is_sibling_cleared("sap_s4hana", "agent_sib", t_latest_ns=500, tentative_ticket=1)
+        )
+        self.assertFalse(
+            self.gateway.should_cascade_tombstone_abort(
+                "sap_s4hana", "agent_sib", dep_seq=1, ack_tomb_seq=0, is_causal_dependent=False
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

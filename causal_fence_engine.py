@@ -44,6 +44,7 @@ class CausalFenceEngine:
         self._tentative_tickets: Dict[str, int] = {}
         self._dest_sequences: Dict[Tuple[str, str], int] = {}
         self._key_settlement_floors: Dict[Tuple[str, str], int] = {}
+        self._max_all_keys_floor: Dict[str, int] = {}
         self._aborted_epochs: Set[str] = set()
 
     def allocate_tentative_vector(self, agent_id: str, latest_ns: int) -> CausalVector:
@@ -62,31 +63,30 @@ class CausalFenceEngine:
     ) -> int:
         """
         Enforces a monotonic per-key settlement floor t_{key_floor}[d, k] updated atomically
-        upon Phase 1 settlement so any sibling settling after F_1 receives t_{F_2,latest} > t_{F_1,latest}.
-        Wildcard '*' updates the destination-wide settlement floor.
+        in O(1) time along with the destination-wide summary watermark t_{max_all_keys}[d]
+        so any sibling settling after F_1 receives t_{F_2,latest} > t_{F_1,latest}.
         """
         with self._lock:
             k = (target_service, resource_key)
             wild_k = (target_service, "*")
             base_floor = self._key_settlement_floors.get(wild_k, 0)
             if resource_key == "*":
-                for (srv, _), val in self._key_settlement_floors.items():
-                    if srv == target_service and val > base_floor:
-                        base_floor = val
+                base_floor = max(base_floor, self._max_all_keys_floor.get(target_service, 0))
             else:
                 base_floor = max(base_floor, self._key_settlement_floors.get(k, 0))
             floor_ns = max(base_floor, commit_latest_ns)
-            self._key_settlement_floors[k] = floor_ns + 1
+            new_floor = floor_ns + 1
+            self._key_settlement_floors[k] = new_floor
+            if new_floor > self._max_all_keys_floor.get(target_service, 0):
+                self._max_all_keys_floor[target_service] = new_floor
             return floor_ns
 
     def get_key_settlement_floor(self, target_service: str, resource_keys: Set[str]) -> int:
-        """Returns max_{k in K(F)} t_{key_floor}[d, k] respecting universal wildcard '*'."""
+        """Returns max_{k in K(F)} t_{key_floor}[d, k] in O(|K(F)|) respecting universal wildcard '*'."""
         with self._lock:
             floor_ns = self._key_settlement_floors.get((target_service, "*"), 0)
             if "*" in resource_keys:
-                for (srv, _), val in self._key_settlement_floors.items():
-                    if srv == target_service and val > floor_ns:
-                        floor_ns = val
+                floor_ns = max(floor_ns, self._max_all_keys_floor.get(target_service, 0))
             else:
                 for rk in resource_keys:
                     floor_ns = max(floor_ns, self._key_settlement_floors.get((target_service, rk), 0))

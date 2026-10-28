@@ -128,21 +128,42 @@ class AgentChronosGateway:
         """Returns the highest contiguous per-destination sequence number delivered at target_service."""
         return self._sidecar_delivered_seq.get((target_service, origin_agent), 0)
 
+    def record_sibling_clear(
+        self, target_service: str, origin_agent: str, t_latest_ns: int, tentative_ticket: int
+    ) -> None:
+        """
+        Records a SIBLING_CLEAR control notification keyed by Phase 1 settlement coordinate
+        <a_{s1}, t_{F_1,latest}, c_{tent,1}> in the ingress sidecar TTL cache so out-of-order
+        WAN arrival prior to F_2 immediately clears F_1's bit without waiting Delta_{jitter_hold}.
+        """
+        if not hasattr(self, "_cleared_siblings"):
+            self._cleared_siblings: set[Tuple[str, str, int, int]] = set()
+        self._cleared_siblings.add((target_service, origin_agent, t_latest_ns, tentative_ticket))
+
+    def is_sibling_cleared(
+        self, target_service: str, origin_agent: str, t_latest_ns: int, tentative_ticket: int
+    ) -> bool:
+        return (target_service, origin_agent, t_latest_ns, tentative_ticket) in getattr(
+            self, "_cleared_siblings", set()
+        )
+
     def reject_stale_sibling_frame(
         self, target_service: str, origin_agent: str, seq_val: int
     ) -> Tuple[int, int]:
         """
-        Handles HTTP 409 Stale Sibling Timestamp rejection at the ingress sidecar by
-        advancing Seq_{loc,d}[a_s] to Seq_{dest,F}[d, a_s] as a tombstoned coordinate
+        Handles HTTP 409 Stale Sibling Timestamp rejection (or proactive Delta_{jitter_hold}
+        expiration when s_tomb = Seq_{dest,F_1}[d, a_{s1}] > 0 was assigned at Phase 2 release)
+        at the ingress sidecar by advancing Seq_{loc,d}[a_s] to s_tomb as a tombstoned coordinate
         so subsequent valid frames from origin_agent do not stall.
         """
         key = (target_service, origin_agent)
         prev_seq = self._sidecar_delivered_seq.get(key, 0)
-        if seq_val == prev_seq + 1:
+        if seq_val > 0 and seq_val == prev_seq + 1:
             self._sidecar_delivered_seq[key] = seq_val
         if not hasattr(self, "_tombstoned_coords"):
             self._tombstoned_coords: Dict[Tuple[str, str], set[int]] = {}
-        self._tombstoned_coords.setdefault(key, set()).add(seq_val)
+        if seq_val > 0:
+            self._tombstoned_coords.setdefault(key, set()).add(seq_val)
         return (409, self._sidecar_delivered_seq.get(key, 0))
 
     def should_cascade_tombstone_abort(
@@ -151,12 +172,16 @@ class AgentChronosGateway:
         dep_agent: str,
         dep_seq: int,
         ack_tomb_seq: int = 0,
+        is_causal_dependent: bool = True,
     ) -> bool:
         """
-        Distinguishes in-flight speculative dependents of a tombstoned coordinate s_tomb
-        (Dep_{d,F}[a_s] >= s_tomb > AckTomb_{d,F}[a_s], which cascade HTTP 409) from
-        legitimate post-409 recovery writes (which attach AckTomb_{d,F}[a_s] >= s_tomb).
+        Cascades HTTP 409 aborts strictly to causally dependent unapplied in-flight frames
+        (V_{F_1} <_V V_F, is_causal_dependent=True) carrying Dep_{d,F}[a_s] >= s_tomb > AckTomb_{d,F}[a_s],
+        while unblocking concurrent sibling reads (V_{F_1} || V_F, is_causal_dependent=False)
+        and permitting post-409 recovery writes (AckTomb_{d,F}[a_s] >= s_tomb).
         """
+        if not is_causal_dependent:
+            return False
         tomb_set = getattr(self, "_tombstoned_coords", {}).get((target_service, dep_agent), set())
         return any(dep_seq >= s_tomb > ack_tomb_seq for s_tomb in tomb_set)
 
