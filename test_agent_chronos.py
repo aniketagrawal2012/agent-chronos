@@ -219,6 +219,42 @@ class TestAgentChronos(unittest.TestCase):
         self.assertEqual(code, 409)
         self.assertEqual(delivered, 1)
 
+        # Distinguish in-flight speculative dependent (ack_tomb_seq=0) from post-409 recovery write (ack_tomb_seq>=1)
+        self.assertTrue(
+            self.gateway.should_cascade_tombstone_abort(
+                "sap_s4hana", "agent_sib", dep_seq=1, ack_tomb_seq=0
+            )
+        )
+        self.assertFalse(
+            self.gateway.should_cascade_tombstone_abort(
+                "sap_s4hana", "agent_sib", dep_seq=1, ack_tomb_seq=1
+            )
+        )
+
+        # Wildcard key intersection and key-floor-adjusted Eq. (5) commit-wait
+        self.assertTrue(self.gateway.fence_engine.keys_intersect({"*"}, {"$.ledger_id"}))
+        self.assertFalse(self.gateway.fence_engine.keys_intersect({"$.a"}, {"$.b"}))
+        wait_key_floor_ns = self.gateway.fence_engine.compute_normative_commit_wait_ns(
+            t_e_latest_ns=10_000_000,
+            v_f_t_max_ns=11_000_000,
+            t_now_earliest_ns=9_000_000,
+            key_floor_ns=13_500_000,
+            wan_pre_ns=500_000,
+        )
+        self.assertEqual(wait_key_floor_ns, 5_000_000)
+
+        # Rule 1(a) vs Rule 1(b) write revocation behavior and Rule 3 abort preemption predicate
+        self.assertEqual(
+            self.gateway.fence_engine.resolve_safe_read_on_write_revocation(is_causal_predecessor=True),
+            PacingStatus.REVOKED,
+        )
+        self.assertEqual(
+            self.gateway.fence_engine.resolve_safe_read_on_write_revocation(is_causal_predecessor=False),
+            PacingStatus.IMMEDIATE,
+        )
+        self.assertTrue(self.gateway.fence_engine.should_preempt_on_abort(11_500_000, 12_000_000))
+        self.assertFalse(self.gateway.fence_engine.should_preempt_on_abort(12_500_000, 12_000_000))
+
 
 if __name__ == "__main__":
     unittest.main()

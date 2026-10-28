@@ -61,14 +61,47 @@ class CausalFenceEngine:
         self, target_service: str, resource_key: str, commit_latest_ns: int
     ) -> int:
         """
-        Enforces a monotonic per-key settlement floor t_{key_floor}[d, k] so any sibling
-        branch settling Phase 1 after F_1 cannot receive an earlier commit bound.
+        Enforces a monotonic per-key settlement floor t_{key_floor}[d, k] updated atomically
+        upon Phase 1 settlement so any sibling settling after F_1 receives t_{F_2,latest} > t_{F_1,latest}.
+        Wildcard '*' updates the destination-wide settlement floor.
         """
         with self._lock:
             k = (target_service, resource_key)
-            floor_ns = max(self._key_settlement_floors.get(k, 0), commit_latest_ns)
+            wild_k = (target_service, "*")
+            base_floor = self._key_settlement_floors.get(wild_k, 0)
+            if resource_key == "*":
+                for (srv, _), val in self._key_settlement_floors.items():
+                    if srv == target_service and val > base_floor:
+                        base_floor = val
+            else:
+                base_floor = max(base_floor, self._key_settlement_floors.get(k, 0))
+            floor_ns = max(base_floor, commit_latest_ns)
             self._key_settlement_floors[k] = floor_ns + 1
             return floor_ns
+
+    def get_key_settlement_floor(self, target_service: str, resource_keys: Set[str]) -> int:
+        """Returns max_{k in K(F)} t_{key_floor}[d, k] respecting universal wildcard '*'."""
+        with self._lock:
+            floor_ns = self._key_settlement_floors.get((target_service, "*"), 0)
+            if "*" in resource_keys:
+                for (srv, _), val in self._key_settlement_floors.items():
+                    if srv == target_service and val > floor_ns:
+                        floor_ns = val
+            else:
+                for rk in resource_keys:
+                    floor_ns = max(floor_ns, self._key_settlement_floors.get((target_service, rk), 0))
+            return floor_ns
+
+    @staticmethod
+    def keys_intersect(keys_a: Set[str], keys_b: Set[str]) -> bool:
+        """
+        Evaluates K(F_1) cap K(F_2) != empty where '*' represents the universal key-space K_d.
+        """
+        if not keys_a or not keys_b:
+            return False
+        if "*" in keys_a or "*" in keys_b:
+            return True
+        return bool(keys_a & keys_b)
 
     @staticmethod
     def should_chain_sibling_read(
@@ -76,9 +109,27 @@ class CausalFenceEngine:
     ) -> bool:
         """
         Evaluates Rule 1(b) overlapping or earlier commit interval condition:
-        t_{E_sib,earliest} <= t_{now,F,latest}.
+        t_{F_sib,earliest} == t_{E_sib,earliest} <= t_{now,F,latest}.
         """
         return t_e_sib_earliest_ns <= t_now_f_latest_ns
+
+    @staticmethod
+    def resolve_safe_read_on_write_revocation(is_causal_predecessor: bool) -> PacingStatus:
+        """
+        Rule 1: If a blocking write is revoked pre-wire via Rule 4, a causally dependent read
+        (case a: V_{F_prior} <_V V_F) is aborted with REVOKED (HTTP 409), whereas an independent
+        concurrent sibling read (case b: V_{F_sib} || V_F) is unblocked and dispatched (IMMEDIATE).
+        """
+        return PacingStatus.REVOKED if is_causal_predecessor else PacingStatus.IMMEDIATE
+
+    @staticmethod
+    def should_preempt_on_abort(t_abort_earliest_ns: int, t_f_latest_ns: int) -> bool:
+        """
+        Rule 3 preemption predicate: a conflicting cross-node abort with TrueTime interval
+        T_abort = [t_{abort,earliest}, t_{abort,latest}] preempts epoch E if
+        t_{abort,earliest} <= t_{F,latest} (covering any abort physically emitted at t_{real,abort} <= t_{F,latest}).
+        """
+        return t_abort_earliest_ns <= t_f_latest_ns
 
     def next_dest_sequence(self, target_service: str, agent_id: str) -> int:
         """
@@ -217,16 +268,19 @@ class CausalFenceEngine:
         t_e_latest_ns: int,
         v_f_t_max_ns: int = 0,
         t_now_earliest_ns: Optional[int] = None,
+        key_floor_ns: int = 0,
+        wan_pre_ns: int = 0,
     ) -> int:
         """
         Evaluates Eq. (5) normative runtime commit-wait barrier:
-        Delta_wait = max(0, t_{E,latest}^* + Delta_{abort_prop} - t_{now,earliest})
-        where t_{E,latest}^* = max(t_{E,latest}, t_{max,F}).
+        Delta_wait = max(0, t_{F,latest} + Delta_{abort_prop}^{eff} - t_{now,earliest})
+        where t_{F,latest} = max(t_{E,latest}, t_{max,F}, max_{k in K(F)} t_{key_floor}[d, k])
+        and Delta_{abort_prop}^{eff} = Delta_{abort_prop} + Delta_{wan_pre}.
         """
-        t_star_latest = max(t_e_latest_ns, v_f_t_max_ns)
+        t_f_latest = max(t_e_latest_ns, v_f_t_max_ns, key_floor_ns)
         now_earliest = (
             t_now_earliest_ns
             if t_now_earliest_ns is not None
             else self.clock.now().earliest_ns
         )
-        return max(0, t_star_latest + self.abort_propagation_ns - now_earliest)
+        return max(0, t_f_latest + self.abort_propagation_ns + wan_pre_ns - now_earliest)

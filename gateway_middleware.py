@@ -140,7 +140,25 @@ class AgentChronosGateway:
         prev_seq = self._sidecar_delivered_seq.get(key, 0)
         if seq_val == prev_seq + 1:
             self._sidecar_delivered_seq[key] = seq_val
+        if not hasattr(self, "_tombstoned_coords"):
+            self._tombstoned_coords: Dict[Tuple[str, str], set[int]] = {}
+        self._tombstoned_coords.setdefault(key, set()).add(seq_val)
         return (409, self._sidecar_delivered_seq.get(key, 0))
+
+    def should_cascade_tombstone_abort(
+        self,
+        target_service: str,
+        dep_agent: str,
+        dep_seq: int,
+        ack_tomb_seq: int = 0,
+    ) -> bool:
+        """
+        Distinguishes in-flight speculative dependents of a tombstoned coordinate s_tomb
+        (Dep_{d,F}[a_s] >= s_tomb > AckTomb_{d,F}[a_s], which cascade HTTP 409) from
+        legitimate post-409 recovery writes (which attach AckTomb_{d,F}[a_s] >= s_tomb).
+        """
+        tomb_set = getattr(self, "_tombstoned_coords", {}).get((target_service, dep_agent), set())
+        return any(dep_seq >= s_tomb > ack_tomb_seq for s_tomb in tomb_set)
 
     def dispatch_agent_tool_call(
         self,
